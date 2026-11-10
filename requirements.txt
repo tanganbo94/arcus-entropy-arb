@@ -1,0 +1,4 @@
+cryptography>=45,<51
+eth-account>=0.13,<0.15
+hyperliquid-python-sdk==0.24.0
+tzdata>=2024.1

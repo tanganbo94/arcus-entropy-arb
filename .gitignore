@@ -1,0 +1,7 @@
+API.txt
+.env
+.env.*
+__pycache__/
+*.pyc
+logs/
+hedge_state.json
