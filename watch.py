@@ -34,13 +34,13 @@ UA = {"User-Agent": "arcus-entropy-arb-watch/1.0", "Accept": "application/json"}
 
 # 默认参数：偏保守，避免用过时中间价去打薄盘
 DEFAULT_NOTIONAL = 2000.0
-DEFAULT_MIN_NET = 5.0          # 扣开仓费和预估滑点后的最小净边，单位 bp
+DEFAULT_MIN_NET = 5.0          # 扣开平仓费用和预估滑点后的最小净边（往返），单位 bp
 DEFAULT_MAX_SLIP = 3.0         # 吃满目标名义本金时，单边允许的滑点 bp
 DEFAULT_INTERVAL = 60          # 扫描间隔秒
 DEFAULT_MIN_DEPTH = 2000.0     # 盘口前若干档合计深度至少要覆盖的名义本金
 DEFAULT_MIN_VOL = 500_000.0    # 24h 成交额下限（USD），过低视为过薄
-TP_REMAIN_BP = 2.0             # 价差收敛到这个净边以内视为止盈
-SL_MIN_ADVERSE_BP = 15.0       # 止损：逆行至少 15bp，或 2 倍开仓净边（取更大）
+TP_MIN_LOCK_BP = 2.0           # 止盈：预计扣完平仓费后至少锁住这么多净边
+SL_MIN_ADVERSE_BP = 15.0       # 止损：价差相对开仓继续走阔至少 15bp，或 2 倍开仓净边（取更大）
 MARGIN_USE = 0.80              # 最多用掉可用保证金的 80%
 POLL_SECS = 8                  # 下单后等待成交确认的秒数
 
@@ -192,6 +192,85 @@ def pos_size(p: dict) -> float:
     return 0.0
 
 
+
+def norm_coin(name: str) -> str:
+    s = (name or "").upper().strip()
+    if ":" in s:
+        s = s.split(":")[-1]
+    for suf in ("-USD", "-USDT", "USD"):
+        if s.endswith(suf) and s != suf:
+            s = s[: -len(suf)]
+            break
+    return s
+
+
+def pos_coin(p: dict) -> str:
+    for k in ("marketDisplayName", "market", "coin", "symbol", "name"):
+        if p.get(k):
+            return norm_coin(str(p[k]))
+    return ""
+
+
+def open_coins(positions: list[dict]) -> set[str]:
+    return {pos_coin(p) for p in positions if pos_size(p) > 0 and pos_coin(p)}
+
+
+def legs_on_coin(positions: list[dict], coin: str) -> list[dict]:
+    """只看这个对冲品种，忽略其他单向残留仓。"""
+    coin_n = norm_coin(coin)
+    return [p for p in positions if pos_size(p) > 0 and pos_coin(p) == coin_n]
+
+
+def coin_size(positions: list[dict], coin: str) -> float:
+    legs = legs_on_coin(positions, coin)
+    return max((pos_size(p) for p in legs), default=0.0)
+
+
+def classify_reduce_result(venue: str, body) -> str:
+    """filled / already_flat / rejected / unknown"""
+    if body is None:
+        return "unknown"
+    if venue == "arcus":
+        if not isinstance(body, dict):
+            return "unknown"
+        st = str(body.get("status") or "").upper()
+        reason = str(body.get("rejectionReason") or "").upper()
+        try:
+            filled = float(body.get("filledSize") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if st == "FILLED" or filled > 0:
+            return "filled"
+        if "REDUCE_ONLY_WOULD_INCREASE" in reason:
+            return "already_flat"
+        if st == "REJECTED":
+            return "rejected"
+        return "unknown"
+    text = json.dumps(body, ensure_ascii=False, default=str)
+    if "Reduce only order would increase position" in text:
+        return "already_flat"
+    if isinstance(body, dict):
+        try:
+            statuses = (((body.get("response") or {}).get("data") or {}).get("statuses") or [])
+        except AttributeError:
+            statuses = []
+        for st in statuses:
+            if isinstance(st, dict) and (st.get("filled") or st.get("resting")):
+                return "filled"
+            if isinstance(st, dict) and st.get("error"):
+                err = str(st.get("error") or "")
+                if "increase position" in err.lower():
+                    return "already_flat"
+                return "rejected"
+        if body.get("status") == "ok" and '"filled"' in text:
+            return "filled"
+    if "error" in text.lower() and "filled" not in text.lower():
+        return "rejected"
+    return "unknown"
+
+
+
+
 def arcus_free(keys) -> float:
     st = t.arcus_status(keys)
     acc = st.get("account") or {}
@@ -222,6 +301,8 @@ def idea_from_fill(a_ask, a_bid, h_ask, h_bid, fee_open: float) -> dict | None:
             "short": "hl",
             "raw_bps": raw,
             "net_bps": raw - fee_open,
+            "net_round_bps": raw - 2 * fee_open,
+            "fee_open": fee_open,
             "buy_px": a_ask,
             "sell_px": h_bid,
         }
@@ -231,6 +312,8 @@ def idea_from_fill(a_ask, a_bid, h_ask, h_bid, fee_open: float) -> dict | None:
         "short": "arcus",
         "raw_bps": raw,
         "net_bps": raw - fee_open,
+        "net_round_bps": raw - 2 * fee_open,
+        "fee_open": fee_open,
         "buy_px": h_ask,
         "sell_px": a_bid,
     }
@@ -254,11 +337,14 @@ def funding_net_bp(long_venue: str, a_fund: float, h_funding: float) -> float:
     return (-h_funding + a_fund) * 10_000
 
 
-def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc) -> dict | None:
+def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc, occupied: set[str] | None = None) -> dict | None:
     by_name = {m.get("marketDisplayName"): m for m in arcus_markets}
-    ranked = sorted(rows, key=lambda r: r.get("net_open_bps") or -999, reverse=True)
+    occupied = {norm_coin(x) for x in (occupied or set()) if x}
+    ranked = sorted(rows, key=lambda r: r.get("net_round_bps") or r.get("net_open_bps") or -999, reverse=True)
     for r in ranked[:25]:
         ticker = r["ticker"]
+        if occupied and (norm_coin(ticker) in occupied or norm_coin(r.get("arcus") or "") in occupied):
+            continue
         am_name = r.get("arcus") or f"{ticker}-USD"
         am = by_name.get(am_name)
         if not am:
@@ -294,7 +380,7 @@ def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc) -> dict | No
         else:
             fee = float(r.get("fee_open_bps") or 9.0)
             idea = idea_from_fill(wa_ask["fill"], wa_bid["fill"], wh_ask["fill"], wh_bid["fill"], fee)
-            if not idea or idea["net_bps"] < args.min_net:
+            if not idea or idea["net_round_bps"] < args.min_net:
                 continue
             mid_idea = idea_from_fill(wa_ask["best"], wa_bid["best"], wh_ask["best"], wh_bid["best"], fee)
             # 中间价边远大于可成交边，多半是过时报价，丢掉
@@ -309,7 +395,7 @@ def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc) -> dict | No
             except (TypeError, ValueError):
                 h_fund = 0.0
             fn = funding_net_bp(idea["long"], a_fund, h_fund)
-            if idea["net_bps"] + fn <= 0:
+            if idea["net_round_bps"] + fn <= 0:
                 continue
             imf = float(am.get("initialMarginFraction") or 0.05)
             # HL max leverage from universe is not in r; use 10 as conservative if unknown
@@ -350,7 +436,7 @@ def place_hedge(keys, cand: dict, dry: bool) -> dict:
     log(
         f"准备下单 {coin}  多{idea['long']} / 空{idea['short']}  "
         f"数量约 {size:.6f}  名义约 {cand['notional']:.0f}U  "
-        f"可成交边 {idea['raw_bps']:+.2f}bp  扣费后 {idea['net_bps']:+.2f}bp"
+        f"可成交边 {idea['raw_bps']:+.2f}bp  扣开仓费后 {idea['net_bps']:+.2f}bp  开平往返后 {idea['net_round_bps']:+.2f}bp"
         + ("  [干跑，不下单]" if dry else "")
     )
     # 复用 trade.py 的下单路径。不能在 class 体里写 coin = coin：
@@ -385,8 +471,9 @@ def wait_and_reconcile(keys, cand: dict) -> tuple[str, dict]:
         except Exception as e:
             log(f"查询持仓失败：{e}")
             continue
-        a_on = any(pos_size(p) > 0 for p in last["arcus"])
-        h_on = any(pos_size(p) > 0 for p in last["hl"])
+        coin = cand["coin"]
+        a_on = bool(legs_on_coin(last["arcus"], coin))
+        h_on = bool(legs_on_coin(last["hl"], coin))
         if a_on and h_on:
             return "both", last
         if a_on and not h_on:
@@ -394,8 +481,9 @@ def wait_and_reconcile(keys, cand: dict) -> tuple[str, dict]:
             continue
         if h_on and not a_on:
             continue
-    a_on = any(pos_size(p) > 0 for p in last["arcus"])
-    h_on = any(pos_size(p) > 0 for p in last["hl"])
+    coin = cand["coin"]
+    a_on = bool(legs_on_coin(last["arcus"], coin))
+    h_on = bool(legs_on_coin(last["hl"], coin))
     if a_on and h_on:
         return "both", last
     if a_on and not h_on:
@@ -424,7 +512,13 @@ def flatten_venue(keys, venue: str, coin: str, close_side: str, size: float) -> 
             perp_dexs = ["" if n == "hl" else n for _, n in dexs]
             body = flat.hl_place_reduce(keys, planned, perp_dexs)
         log(f"{venue} reduce-only 已提交：{redact(json.dumps(body, ensure_ascii=False, default=str)[:500])}")
-        return True
+        kind = classify_reduce_result(venue, body)
+        if kind == "rejected":
+            log(f"{venue} 平仓单被拒绝，不能当成已成交。")
+            return False
+        if kind == "already_flat":
+            log(f"{venue} reduce-only 提示已无该方向仓位，等持仓核对确认。")
+        return kind in ("filled", "already_flat", "unknown")
     except Exception as e:
         log(f"{venue} 平仓失败：{e}")
         return False
@@ -436,17 +530,14 @@ def flatten_one_leg(keys, cand: dict, status: str, detail: dict) -> None:
     if status == "one_arcus":
         # Arcus 有仓，HL 没有。把 Arcus 那条平掉。
         size = 0.0
-        for p in detail.get("arcus") or []:
-            size = max(size, pos_size(p))
+        size = coin_size(detail.get("arcus") or [], coin)
         if size <= 0:
             size = cand["size"]
         close_side = "SELL" if idea["long"] == "arcus" else "BUY"
         log(f"单腿：只有 Arcus 成交，立刻 reduce-only 平掉（{close_side} {size}）")
         flatten_venue(keys, "arcus", coin, close_side, size)
     elif status == "one_hl":
-        size = 0.0
-        for p in detail.get("hl") or []:
-            size = max(size, pos_size(p))
+        size = coin_size(detail.get("hl") or [], coin)
         if size <= 0:
             size = cand["size"]
         close_side = "SELL" if idea["long"] == "hl" else "BUY"
@@ -467,15 +558,17 @@ def close_both(keys, state: dict, reason: str) -> None:
     flatten_venue(keys, "hl", coin, h_side, size)
     time.sleep(2)
     try:
-        a_on = any(pos_size(p) > 0 for p in arcus_positions(keys))
-        h_on = any(pos_size(p) > 0 for p in hl_positions(keys))
+        a_on = bool(legs_on_coin(arcus_positions(keys), coin))
+        h_on = bool(legs_on_coin(hl_positions(keys), coin))
         if not a_on and not h_on:
             log("两边已平仓。")
             save_state(None)
-        else:
-            log(f"平仓后仍有仓位：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。请在网页确认。")
+            return True
+        log(f"平仓后对冲品种 {coin} 仍有仓位：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。本轮先不新开，下一轮继续平。")
+        return False
     except Exception as e:
-        log(f"平仓后核对失败：{e}")
+        log(f"平仓后核对失败：{e}。先不清掉本地对冲记录。")
+        return False
 
 
 def manage_open(keys, state: dict, args) -> None:
@@ -501,30 +594,42 @@ def manage_open(keys, state: dict, args) -> None:
             return
         entry = float(state.get("entry_raw_bps") or idea.get("raw_bps") or 0)
         entry_net = float(state.get("entry_net_bps") or idea.get("net_bps") or 0)
+        fee_open = float(state.get("fee_open") or idea.get("fee_open") or (entry - entry_net) or 9.0)
+        fee_close = fee_open
         remain = cur  # 仍按开仓方向的可成交价差
-        adverse = entry - remain
+        # 正数=价差相对开仓走阔（逆行）；收敛时为负，不能当成止损
+        adverse = remain - entry
+        expected_net = (entry - remain) - fee_open - fee_close
         sl = max(SL_MIN_ADVERSE_BP, 2.0 * abs(entry_net))
-        log(f"持仓 {coin}：当前可成交价差 {remain:+.2f}bp（开仓 {entry:+.2f}bp），偏离 {adverse:+.2f}bp，止盈线 {TP_REMAIN_BP}bp，止损线 {sl:.1f}bp")
+        log(
+            f"持仓 {coin}：当前可成交价差 {remain:+.2f}bp（开仓 {entry:+.2f}bp），"
+            f"走阔 {adverse:+.2f}bp，预估扣平仓费后 {expected_net:+.2f}bp，"
+            f"止盈锁 {TP_MIN_LOCK_BP}bp，止损走阔 {sl:.1f}bp"
+        )
         a_fund = float(am.get("nextFundingRate") or am.get("fundingRate") or 0)
-        # funding on HL: reuse last scan if needed; skip if cannot
-        if remain <= TP_REMAIN_BP:
-            close_both(keys, state, f"价差收敛止盈，当前 {remain:+.2f}bp")
+        if expected_net >= TP_MIN_LOCK_BP:
+            close_both(keys, state, f"价差收敛止盈，当前 {remain:+.2f}bp，预估扣平仓费后 {expected_net:+.2f}bp")
             return
         if adverse >= sl:
-            close_both(keys, state, f"价差逆行止损，偏离 {adverse:+.2f}bp ≥ {sl:.1f}bp")
+            close_both(keys, state, f"价差逆行走阔止损，走阔 {adverse:+.2f}bp ≥ {sl:.1f}bp")
             return
         fn = funding_net_bp(idea["long"], a_fund, float(state.get("hl_funding") or 0))
-        if remain + fn <= 0:
-            close_both(keys, state, "下一次资金费可能吃掉剩余价差，提前平仓")
+        if expected_net >= TP_MIN_LOCK_BP and remain + fn - fee_close <= 0:
+            close_both(keys, state, "下一次资金费可能吃掉已能锁定的净边，提前平仓")
     except Exception as e:
         log(f"持仓管理出错：{e}")
 
 
 def already_in_market(keys) -> bool:
+    """只有两边同品种、像未记录的对冲时才拦住新开仓。单向残留仓不会挡住其他品种的套利。"""
     try:
-        a = any(pos_size(p) > 0 for p in arcus_positions(keys))
-        h = any(pos_size(p) > 0 for p in hl_positions(keys))
-        return a or h
+        a = open_coins(arcus_positions(keys))
+        h = open_coins(hl_positions(keys))
+        both = a & h
+        if both:
+            log("发现两边同品种仓位但本地没有对冲记录：" + "、".join(sorted(both)) + "。本轮只观察，避免重复开对冲。")
+            return True
+        return False
     except Exception as e:
         log(f"检查是否已有仓位失败：{e}")
         return True  # 不确定时不要再开新仓
@@ -533,7 +638,10 @@ def already_in_market(keys) -> bool:
 def one_round(keys, args) -> None:
     state = load_state()
     if state and not args.dry_run:
-        manage_open(keys, state, args)
+        if state.get("mode") == "flatten_residual":
+            close_both(keys, state, f"补平单腿残留 {state.get('coin')}")
+        else:
+            manage_open(keys, state, args)
         if load_state():
             return
         # 已平仓则本轮不再立刻开新仓，下一轮再扫
@@ -554,7 +662,11 @@ def one_round(keys, args) -> None:
         log(f"读保证金失败：{e}")
         return
     markets = t.arcus_markets()
-    cand = pick_candidate(args, keys, rows, markets, a_free, h_usdc)
+    try:
+        occupied = open_coins(arcus_positions(keys)) | open_coins(hl_positions(keys))
+    except Exception:
+        occupied = set()
+    cand = pick_candidate(args, keys, rows, markets, a_free, h_usdc, occupied)
     if not cand:
         log(f"本轮没有同时满足「扣费+滑点后 ≥ {args.min_net}bp、盘口够深、资金费吃不完」的机会。保证金 Arcus {a_free:.2f} / Entropy USDC {h_usdc:.2f}")
         return
@@ -575,15 +687,38 @@ def one_round(keys, args) -> None:
             "notional": cand["notional"],
             "entry_raw_bps": cand["idea"]["raw_bps"],
             "entry_net_bps": cand["idea"]["net_bps"],
+            "fee_open": cand["idea"].get("fee_open") or cand.get("fee_open") or 9.0,
             "hl_funding": 0,
         }
         save_state(st)
         sl = max(SL_MIN_ADVERSE_BP, 2.0 * abs(st["entry_net_bps"]))
-        log(f"两腿都有仓，开始按价差管理。止盈：价差回到 {TP_REMAIN_BP}bp 以内；止损：逆行 ≥ {sl:.1f}bp。")
+        log(
+            f"两腿都有仓，开始按价差管理。"
+            f"止盈：预计扣平仓费后净边 ≥ {TP_MIN_LOCK_BP}bp；"
+            f"止损：价差走阔 ≥ {sl:.1f}bp。"
+        )
     elif status in ("one_arcus", "one_hl"):
         flatten_one_leg(keys, cand, status, detail)
         time.sleep(2)
-        save_state(None)
+        a_on = bool(legs_on_coin(arcus_positions(keys), cand["coin"]))
+        h_on = bool(legs_on_coin(hl_positions(keys), cand["coin"]))
+        if a_on or h_on:
+            log(f"单腿平仓后 {cand['coin']} 仍有仓：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。留下记录，下一轮继续平，不开新仓。")
+            save_state({
+                "opened_at": now_sh(),
+                "coin": cand["coin"],
+                "ticker": cand["ticker"],
+                "idea": cand["idea"],
+                "size": cand["size"],
+                "notional": cand["notional"],
+                "mode": "flatten_residual",
+                "entry_raw_bps": cand["idea"]["raw_bps"],
+                "entry_net_bps": cand["idea"]["net_bps"],
+                "fee_open": cand["idea"].get("fee_open") or cand.get("fee_open") or 9.0,
+            })
+        else:
+            log(f"单腿 {cand['coin']} 已确认平掉。")
+            save_state(None)
     elif status == "none":
         log("两腿都没有成交（可能是 IOC 未撮合），不开仓。")
         save_state(None)
@@ -598,7 +733,7 @@ def main(argv=None) -> int:
     p.add_argument("--once", action="store_true", help="只跑一轮")
     p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="扫描间隔秒，默认 60")
     p.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL, help="目标名义本金（U），默认 2000")
-    p.add_argument("--min-net", type=float, default=DEFAULT_MIN_NET, help="扣费和滑点后最小净边（bp），默认 5")
+    p.add_argument("--min-net", type=float, default=DEFAULT_MIN_NET, help="扣开平仓费用和滑点后最小净边（bp），默认 5")
     p.add_argument("--max-slip", type=float, default=DEFAULT_MAX_SLIP, help="单边最大滑点（bp），默认 3")
     p.add_argument("--min-depth", type=float, default=DEFAULT_MIN_DEPTH, help="盘口前档最小深度（U），默认 2000")
     p.add_argument("--min-vol", type=float, default=DEFAULT_MIN_VOL, help="24h 成交额下限（U），默认 50万")
@@ -612,7 +747,7 @@ def main(argv=None) -> int:
         return 2
 
     mode = "干跑（不下单）" if args.dry_run else "实盘"
-    log(f"本地对冲循环启动：{mode}。名义约 {args.notional:.0f}U，最小净边 {args.min_net}bp。密钥只读本机 API.txt。按 Ctrl+C 停止。")
+    log(f"本地对冲循环启动：{mode}。名义约 {args.notional:.0f}U，最小净边（开平往返）{args.min_net}bp。密钥只读本机 API.txt。按 Ctrl+C 停止。")
     log(f"账户 {short_addr(keys.arcus_wallet_address)}  间隔 {args.interval}s")
 
     while True:
