@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+from types import SimpleNamespace
 import json
 import sys
 import time
@@ -352,18 +353,18 @@ def place_hedge(keys, cand: dict, dry: bool) -> dict:
         f"可成交边 {idea['raw_bps']:+.2f}bp  扣费后 {idea['net_bps']:+.2f}bp"
         + ("  [干跑，不下单]" if dry else "")
     )
-    # 复用 trade.py 的下单路径
-    class Args:
-        live = not dry
-        i_confirm = not dry
-        dry_run = dry
-        long = idea["long"]
-        short = idea["short"]
-        coin = coin
-        size = f"{size:.8f}".rstrip("0").rstrip(".")
-        price = None
-
-    args = Args()
+    # 复用 trade.py 的下单路径。不能在 class 体里写 coin = coin：
+    # class 作用域不会捕获外层局部变量，会直接 NameError。
+    args = SimpleNamespace(
+        live=not dry,
+        i_confirm=not dry,
+        dry_run=dry,
+        long=idea["long"],
+        short=idea["short"],
+        coin=coin,
+        size=f"{size:.8f}".rstrip("0").rstrip("."),
+        price=None,
+    )
     if dry:
         rc = t.cmd_plan_or_live(keys, args)
         return {"ok": rc == 0, "dry": True, "rc": rc}
