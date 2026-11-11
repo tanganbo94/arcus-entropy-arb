@@ -11,7 +11,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta
-from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP
+from decimal import Decimal, ROUND_CEILING, ROUND_DOWN, ROUND_FLOOR, ROUND_HALF_UP
+from fractions import Fraction
+from math import gcd
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
@@ -283,6 +285,33 @@ def arcus_markets() -> list[dict]:
     if st != 200 or not isinstance(body, dict):
         raise TradeError(_arcus_explain(st, body) if st != 200 else "Arcus 市场列表格式异常。")
     return body.get("markets") or []
+
+
+def step_lcm(a, b) -> Decimal:
+    """两个下单步长的最小公倍数，两边都能整除。"""
+    fa, fb = Fraction(str(a)), Fraction(str(b))
+    l_num = fa.numerator // gcd(fa.numerator, fb.numerator) * fb.numerator
+    l_den = gcd(fa.denominator, fb.denominator)
+    return Decimal(l_num) / Decimal(l_den)
+
+
+def common_hedge_size(raw, arcus_step, hl_sz_decimals, min_order=None) -> Decimal:
+    """先按目标数量，再向下取到两边都能下的同一币数量，避免对冲敞口。"""
+    hl_step = Decimal(10) ** -int(hl_sz_decimals)
+    step = step_lcm(Decimal(str(arcus_step)), hl_step)
+    qty = (Decimal(str(raw)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+    if qty <= 0:
+        raise TradeError(f"按两边共同步长 {dec_str(step)} 对齐后数量为 0，请加大名义或数量。")
+    if min_order not in (None, "", 0, "0") and qty < Decimal(str(min_order)):
+        raise TradeError(f"对齐后数量 {dec_str(qty)} 小于 Arcus 最小下单量 {min_order}。")
+    return qty
+
+
+def qty_equal(a, b) -> bool:
+    try:
+        return Decimal(str(a)) == Decimal(str(b))
+    except Exception:
+        return str(a) == str(b)
 
 
 def snap_decimal(value, unit, rounding=ROUND_HALF_UP) -> Decimal:
@@ -917,6 +946,12 @@ def cmd_plan_or_live(keys: Keys, args) -> int:
         sides = {"arcus": None, "hl": None}
         sides[args.long] = "BUY"
         sides[args.short] = "SELL"
+        raw_size = size
+        size = common_hedge_size(raw_size, am.get("stepSize"), hm.get("sz_decimals") or 0, am.get("minOrderSize"))
+        args.aligned_size = dec_str(size)
+        args.size = args.aligned_size
+        if size != raw_size:
+            print(f"数量已按两边共同步长对齐为 {dec_str(size)}（原 {dec_str(raw_size)}），两腿使用同一币数量。")
         a_ord = arcus_build_order(keys, am, sides["arcus"], size, args.price)
         h_ord = hl_build_order(hm, sides["hl"], size, args.price, keys.hl_account_address)
     except TradeError as e:
@@ -932,8 +967,9 @@ def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
     for label, planned in (("Arcus", a_ord), ("Hyperliquid", h_ord)):
         print(f"\n[{label}]")
         print_planned(planned)
-    if a_ord["size"] != h_ord["size"]:
-        print(f"\n注意：两边对齐步长后的数量不同（Arcus {a_ord['size']} vs HL {h_ord['size']}），对冲可能不完全匹配。")
+    if not qty_equal(a_ord["size"], h_ord["size"]):
+        print(f"\n拒绝下单：两边数量仍不一致（Arcus {a_ord['size']} vs HL {h_ord['size']}），不对冲。")
+        return 2
     if not live:
         print("\n这是干跑，订单没有发送。确认无误后再使用：")
         print(

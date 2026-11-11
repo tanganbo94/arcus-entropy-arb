@@ -33,11 +33,15 @@ STATE_PATH = HERE / "hedge_state.json"
 UA = {"User-Agent": "arcus-entropy-arb-watch/1.0", "Accept": "application/json"}
 
 # 默认参数：偏保守，避免用过时中间价去打薄盘
-DEFAULT_NOTIONAL = 2000.0
+DEFAULT_NOTIONAL = 1500.0
 DEFAULT_MIN_NET = 5.0          # 扣开平仓费用和预估滑点后的最小净边（往返），单位 bp
 DEFAULT_MAX_SLIP = 3.0         # 吃满目标名义本金时，单边允许的滑点 bp
-DEFAULT_INTERVAL = 60          # 扫描间隔秒
-DEFAULT_MIN_DEPTH = 2000.0     # 盘口前若干档合计深度至少要覆盖的名义本金
+DEFAULT_INTERVAL = 300         # 空仓扫描间隔秒（5 分钟），降低 Arcus 请求频率
+HOLD_INTERVAL = 60             # 已有对冲时仍按 60 秒盯价差
+BOOK_CHECK_LIMIT = 8           # 每轮最多拉这么多币的盘口，避免一轮打满限速
+STATUS_CACHE_SECS = 30         # 同一轮里复用账户状态，避免 apiKeys/account 连打三次
+LIMIT_BACKOFF_SECS = 120       # 碰到 429 后再等这么久
+DEFAULT_MIN_DEPTH = 1500.0     # 与目标名义仓位一致，盘口前档合计至少覆盖 1500U
 DEFAULT_MIN_VOL = 500_000.0    # 24h 成交额下限（USD），过低视为过薄
 TP_MIN_LOCK_BP = 2.0           # 止盈：预计扣完平仓费后至少锁住这么多净边
 SL_MIN_ADVERSE_BP = 15.0       # 止损：价差相对开仓继续走阔至少 15bp，或 2 倍开仓净边（取更大）
@@ -58,10 +62,52 @@ def log(msg: str) -> None:
         f.write(line + "\n")
 
 
+_arcus_status_cache: dict = {"t": 0.0, "data": None}
+_backoff_until = 0.0
+
+
+def note_arcus_limit(msg) -> None:
+    """记录 429，让主循环多歇一会。"""
+    global _backoff_until
+    text = str(msg)
+    if "429" not in text and "限速" not in text and "rate limited" not in text.lower():
+        return
+    extra = LIMIT_BACKOFF_SECS
+    until = time.time() + extra
+    if until > _backoff_until:
+        _backoff_until = until
+        log(f"Arcus 触发限速，接下来至少 {extra:.0f} 秒后再扫，避免连续打满。")
+
+
+def invalidate_arcus_status() -> None:
+    _arcus_status_cache["t"] = 0.0
+    _arcus_status_cache["data"] = None
+
+
+def arcus_status_cached(keys, ttl: float | None = None, fresh: bool = False):
+    ttl = 0 if fresh else (STATUS_CACHE_SECS if ttl is None else ttl)
+    now = time.time()
+    data = _arcus_status_cache.get("data")
+    if data is not None and not fresh and now - float(_arcus_status_cache.get("t") or 0) < ttl:
+        return data
+    try:
+        data = t.arcus_status(keys)
+    except Exception as e:
+        note_arcus_limit(e)
+        raise
+    _arcus_status_cache["t"] = now
+    _arcus_status_cache["data"] = data
+    return data
+
+
 def http_get(url: str, timeout: int = 15):
     req = urllib.request.Request(url, headers=UA)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode() or "null")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "null")
+    except Exception as e:
+        note_arcus_limit(e)
+        raise
 
 
 def load_state() -> dict | None:
@@ -122,7 +168,8 @@ def walk_book(levels, notional: float, typ: str, is_bid: bool) -> dict:
 def arcus_book(name: str) -> dict:
     try:
         return http_get(f"https://api.arcus.xyz/v1/l2OrderBook/{name}?nLevels=20") or {}
-    except Exception:
+    except Exception as e:
+        note_arcus_limit(e)
         return {}
 
 
@@ -177,8 +224,8 @@ def hl_positions(keys) -> list[dict]:
     return out
 
 
-def arcus_positions(keys) -> list[dict]:
-    st = t.arcus_status(keys)
+def arcus_positions(keys, fresh: bool = False) -> list[dict]:
+    st = arcus_status_cached(keys, fresh=fresh)
     return st.get("positions") or []
 
 
@@ -272,7 +319,7 @@ def classify_reduce_result(venue: str, body) -> str:
 
 
 def arcus_free(keys) -> float:
-    st = t.arcus_status(keys)
+    st = arcus_status_cached(keys)
     acc = st.get("account") or {}
     try:
         return float(acc.get("freeCollateral") or acc.get("equity") or 0)
@@ -341,7 +388,7 @@ def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc, occupied: se
     by_name = {m.get("marketDisplayName"): m for m in arcus_markets}
     occupied = {norm_coin(x) for x in (occupied or set()) if x}
     ranked = sorted(rows, key=lambda r: r.get("net_round_bps") or r.get("net_open_bps") or -999, reverse=True)
-    for r in ranked[:25]:
+    for r in ranked[:BOOK_CHECK_LIMIT]:
         ticker = r["ticker"]
         if occupied and (norm_coin(ticker) in occupied or norm_coin(r.get("arcus") or "") in occupied):
             continue
@@ -451,11 +498,19 @@ def place_hedge(keys, cand: dict, dry: bool) -> dict:
         size=f"{size:.8f}".rstrip("0").rstrip("."),
         price=None,
     )
+    def _apply_aligned():
+        aligned = getattr(args, "aligned_size", None)
+        if aligned is not None:
+            cand["size"] = float(aligned)
+            log(f"两腿按同一币数量下单：{aligned}")
+
     if dry:
         rc = t.cmd_plan_or_live(keys, args)
+        _apply_aligned()
         return {"ok": rc == 0, "dry": True, "rc": rc}
 
     rc = t.cmd_plan_or_live(keys, args)
+    _apply_aligned()
     return {"ok": rc == 0, "dry": False, "rc": rc, "args": args}
 
 
@@ -466,9 +521,10 @@ def wait_and_reconcile(keys, cand: dict) -> tuple[str, dict]:
     while time.time() < deadline:
         time.sleep(1.5)
         try:
-            last["arcus"] = arcus_positions(keys)
+            last["arcus"] = arcus_positions(keys, fresh=True)
             last["hl"] = hl_positions(keys)
         except Exception as e:
+            note_arcus_limit(e)
             log(f"查询持仓失败：{e}")
             continue
         coin = cand["coin"]
@@ -512,6 +568,7 @@ def flatten_venue(keys, venue: str, coin: str, close_side: str, size: float) -> 
             perp_dexs = ["" if n == "hl" else n for _, n in dexs]
             body = flat.hl_place_reduce(keys, planned, perp_dexs)
         log(f"{venue} reduce-only 已提交：{redact(json.dumps(body, ensure_ascii=False, default=str)[:500])}")
+        invalidate_arcus_status()
         kind = classify_reduce_result(venue, body)
         if kind == "rejected":
             log(f"{venue} 平仓单被拒绝，不能当成已成交。")
@@ -558,7 +615,7 @@ def close_both(keys, state: dict, reason: str) -> None:
     flatten_venue(keys, "hl", coin, h_side, size)
     time.sleep(2)
     try:
-        a_on = bool(legs_on_coin(arcus_positions(keys), coin))
+        a_on = bool(legs_on_coin(arcus_positions(keys, fresh=True), coin))
         h_on = bool(legs_on_coin(hl_positions(keys), coin))
         if not a_on and not h_on:
             log("两边已平仓。")
@@ -617,6 +674,7 @@ def manage_open(keys, state: dict, args) -> None:
         if expected_net >= TP_MIN_LOCK_BP and remain + fn - fee_close <= 0:
             close_both(keys, state, "下一次资金费可能吃掉已能锁定的净边，提前平仓")
     except Exception as e:
+        note_arcus_limit(e)
         log(f"持仓管理出错：{e}")
 
 
@@ -631,6 +689,7 @@ def already_in_market(keys) -> bool:
             return True
         return False
     except Exception as e:
+        note_arcus_limit(e)
         log(f"检查是否已有仓位失败：{e}")
         return True  # 不确定时不要再开新仓
 
@@ -653,15 +712,16 @@ def one_round(keys, args) -> None:
 
     snap = scan_mod.fetch_snapshot()
     rows = scan_mod.build_rows(*snap)
+    markets = snap[0] or []
     a_free = 0.0
     h_usdc = 0.0
     try:
         a_free = arcus_free(keys)
         h_usdc = hl_spot_usdc(keys)
     except Exception as e:
+        note_arcus_limit(e)
         log(f"读保证金失败：{e}")
         return
-    markets = t.arcus_markets()
     try:
         occupied = open_coins(arcus_positions(keys)) | open_coins(hl_positions(keys))
     except Exception:
@@ -671,6 +731,7 @@ def one_round(keys, args) -> None:
         log(f"本轮没有同时满足「扣费+滑点后 ≥ {args.min_net}bp、盘口够深、资金费吃不完」的机会。保证金 Arcus {a_free:.2f} / Entropy USDC {h_usdc:.2f}")
         return
     result = place_hedge(keys, cand, dry=args.dry_run)
+    invalidate_arcus_status()
     if args.dry_run:
         return
     if not result.get("ok"):
@@ -700,7 +761,7 @@ def one_round(keys, args) -> None:
     elif status in ("one_arcus", "one_hl"):
         flatten_one_leg(keys, cand, status, detail)
         time.sleep(2)
-        a_on = bool(legs_on_coin(arcus_positions(keys), cand["coin"]))
+        a_on = bool(legs_on_coin(arcus_positions(keys, fresh=True), cand["coin"]))
         h_on = bool(legs_on_coin(hl_positions(keys), cand["coin"]))
         if a_on or h_on:
             log(f"单腿平仓后 {cand['coin']} 仍有仓：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。留下记录，下一轮继续平，不开新仓。")
@@ -731,11 +792,11 @@ def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="本地循环：扫同名价差并在本机下对冲单")
     p.add_argument("--dry-run", action="store_true", help="只扫描不下单")
     p.add_argument("--once", action="store_true", help="只跑一轮")
-    p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="扫描间隔秒，默认 60")
-    p.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL, help="目标名义本金（U），默认 2000")
+    p.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="空仓扫描间隔秒，默认 300（5 分钟）；持仓中仍为 60 秒")
+    p.add_argument("--notional", type=float, default=DEFAULT_NOTIONAL, help="目标名义本金（U），默认 1500")
     p.add_argument("--min-net", type=float, default=DEFAULT_MIN_NET, help="扣开平仓费用和滑点后最小净边（bp），默认 5")
     p.add_argument("--max-slip", type=float, default=DEFAULT_MAX_SLIP, help="单边最大滑点（bp），默认 3")
-    p.add_argument("--min-depth", type=float, default=DEFAULT_MIN_DEPTH, help="盘口前档最小深度（U），默认 2000")
+    p.add_argument("--min-depth", type=float, default=DEFAULT_MIN_DEPTH, help="盘口前档最小深度（U），默认 1500，与名义仓位一致")
     p.add_argument("--min-vol", type=float, default=DEFAULT_MIN_VOL, help="24h 成交额下限（U），默认 50万")
     args = p.parse_args(argv)
 
@@ -747,20 +808,31 @@ def main(argv=None) -> int:
         return 2
 
     mode = "干跑（不下单）" if args.dry_run else "实盘"
-    log(f"本地对冲循环启动：{mode}。名义约 {args.notional:.0f}U，最小净边（开平往返）{args.min_net}bp。密钥只读本机 API.txt。按 Ctrl+C 停止。")
-    log(f"账户 {short_addr(keys.arcus_wallet_address)}  间隔 {args.interval}s")
+    log(
+        f"本地对冲循环启动：{mode}。名义约 {args.notional:.0f}U，最小净边（开平往返）{args.min_net}bp。"
+        f"空仓扫描间隔 {args.interval}s，持仓盯盘 {HOLD_INTERVAL}s。密钥只读本机 API.txt。按 Ctrl+C 停止。"
+    )
+    log(f"账户 {short_addr(keys.arcus_wallet_address)}  空仓间隔 {args.interval}s")
 
     while True:
         try:
             one_round(keys, args)
         except KeyboardInterrupt:
             raise
-        except Exception:
+        except Exception as e:
+            note_arcus_limit(e)
             log("本轮出错：\n" + redact(traceback.format_exc()))
         if args.once:
             log("只跑一轮，已结束。")
             return 0
-        time.sleep(max(5, args.interval))
+        if load_state():
+            delay = HOLD_INTERVAL
+        else:
+            delay = args.interval
+        remain = _backoff_until - time.time()
+        if remain > 0:
+            delay = max(delay, remain)
+        time.sleep(max(5, delay))
 
 
 if __name__ == "__main__":
