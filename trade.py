@@ -37,6 +37,7 @@ HL_EXCHANGE = "https://api.hyperliquid.xyz/exchange"
 UA = "arcus-entropy-arb/1.1"
 TZ = ZoneInfo("Asia/Shanghai")
 SLIPPAGE = Decimal("0.05")  # 未指定 --price 时的保护限价：偏离标记价 5%
+LAST_OPEN_RESULT: dict | None = None  # 最近一次开仓回报，供盯盘识别盘后限幅拒单
 GTT_MONTHS_US = 40 * 86_400 * 1_000_000  # 40 天后，微秒（须 ≥ 一个月）
 
 OP_PLACE = 1
@@ -448,6 +449,98 @@ def dec_str(value: Decimal) -> str:
     return s or "0"
 
 
+
+def _num(v):
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def arcus_offhours_bounds(market: dict | None) -> dict | None:
+    """盘后交易限幅。只在 isOutsideRth 且已有结算锚/上下限时有效；盘中或加密货币返回 None。"""
+    if not market:
+        return None
+    outside = market.get("isOutsideRth")
+    settlement = market.get("currentSettlementPrice")
+    if not outside and settlement in (None, ""):
+        return None
+    upper = _num(market.get("upperTradingBound"))
+    lower = _num(market.get("lowerTradingBound"))
+    if upper is None and lower is None:
+        return None
+    return {
+        "upper": upper,
+        "lower": lower,
+        "settlement": _num(settlement),
+        "next_upper": _num(market.get("nextUpperTradingBound")),
+        "next_lower": _num(market.get("nextLowerTradingBound")),
+        "upper_in_zone": bool(market.get("isUpperInExpansionZone")),
+        "lower_in_zone": bool(market.get("isLowerInExpansionZone")),
+        "upper_expand_at": _num(market.get("upperExpectedExpansionAt")),
+        "lower_expand_at": _num(market.get("lowerExpectedExpansionAt")),
+    }
+
+
+def arcus_bound_block(market: dict | None, side: str, fill_px=None) -> str | None:
+    """买单会碰到上限或卖单会碰到下限时返回原因，否则 None。"""
+    bounds = arcus_offhours_bounds(market)
+    if not bounds:
+        return None
+    side_u = (side or "").upper()
+    if side_u in {"LONG", "BID"}:
+        side_u = "BUY"
+    elif side_u in {"SHORT", "ASK"}:
+        side_u = "SELL"
+    px = _num(fill_px)
+    if px is None and market:
+        for k in ("markPrice", "oraclePrice", "lastTradePrice"):
+            px = _num(market.get(k))
+            if px is not None:
+                break
+    if px is None:
+        return None
+    if side_u == "BUY" and bounds["upper"] is not None and px >= bounds["upper"] - 1e-12:
+        return f"盘后买价 {px:.4g} 触及 Arcus 上限 {bounds['upper']:.4g}"
+    if side_u == "SELL" and bounds["lower"] is not None and px <= bounds["lower"] + 1e-12:
+        return f"盘后卖价 {px:.4g} 触及 Arcus 下限 {bounds['lower']:.4g}"
+    return None
+
+
+def apply_arcus_offhours_limit(market: dict, is_buy: bool, mid_d: Decimal, px: Decimal, tick) -> Decimal:
+    """市价保护限价必须严格落在盘后限幅内；标记价已撞线则拒绝下单。"""
+    bounds = arcus_offhours_bounds(market)
+    if not bounds:
+        return px
+    name = market.get("marketDisplayName") or market.get("baseAsset") or "该市场"
+    tick_d = Decimal(str(tick))
+    if tick_d <= 0:
+        tick_d = Decimal("0.00000001")
+    if is_buy and bounds["upper"] is not None:
+        upper = Decimal(str(bounds["upper"]))
+        if mid_d >= upper:
+            raise TradeError(
+                f"Arcus {name} 盘后标记价 {dec_str(mid_d)} 已触及或超过上限 {dec_str(upper)}，买单会被拒，不下单。"
+            )
+        if px >= upper:
+            px = snap_decimal(upper - tick_d, tick, rounding=ROUND_FLOOR)
+        if px >= upper or px <= 0:
+            raise TradeError(f"Arcus {name} 盘后保护限价会触及上限 {dec_str(upper)}，不下单。")
+    elif (not is_buy) and bounds["lower"] is not None:
+        lower = Decimal(str(bounds["lower"]))
+        if mid_d <= lower:
+            raise TradeError(
+                f"Arcus {name} 盘后标记价 {dec_str(mid_d)} 已触及或低于下限 {dec_str(lower)}，卖单会被拒，不下单。"
+            )
+        if px <= lower:
+            px = snap_decimal(lower + tick_d, tick, rounding=ROUND_CEILING)
+        if px <= lower or px <= 0:
+            raise TradeError(f"Arcus {name} 盘后保护限价会触及下限 {dec_str(lower)}，不下单。")
+    return px
+
+
 def arcus_build_order(
     keys: Keys,
     market: dict,
@@ -474,6 +567,8 @@ def arcus_build_order(
         band = mid_d * Decimal("0.10")
         if abs(px - mid_d) > band + Decimal(str(tick)):
             raise TradeError("Arcus 保护限价超出标记价 10% 的允许范围，请改用 --price 指定限价。")
+
+    px = apply_arcus_offhours_limit(market, is_buy, mid_d, px, tick)
 
     ts = time.time_ns()
     good_til = int(time.time() * 1_000_000) + GTT_MONTHS_US
@@ -1006,6 +1101,7 @@ def cmd_quote(keys: Keys, coin: str) -> int:
         dexs = hl_dex_list()
         cands = hl_find_coin(dexs, coin)
     except TradeError as e:
+        LAST_OPEN_RESULT = {"venue": "arcus", "kind": "rejected", "reason": str(e), "filled_size": 0.0}
         print(redact(str(e)))
         return 1
     a_px = am.get("markPrice") or am.get("oraclePrice") or am.get("lastTradePrice")
@@ -1045,6 +1141,8 @@ def cmd_plan_or_live(keys: Keys, args) -> int:
     if not args.coin or args.size is None:
         print("下单预览/实盘需要 --coin 和 --size。")
         return 2
+    global LAST_OPEN_RESULT
+    LAST_OPEN_RESULT = None
     try:
         size = Decimal(str(args.size))
         if size <= 0:
@@ -1073,6 +1171,7 @@ def cmd_plan_or_live(keys: Keys, args) -> int:
 
 
 def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
+    global LAST_OPEN_RESULT
     # 上面那次「腿 1」可能顺序混乱，这里重新完整打印两腿。
     _say("—— 将发送的两腿（完整）——")
     for label, planned in (("Arcus", a_ord), ("Hyperliquid", h_ord)):
@@ -1103,6 +1202,7 @@ def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
         return 1
 
     a_info = open_fill_info("arcus", results["arcus"])
+    LAST_OPEN_RESULT = {"venue": "arcus", **a_info}
     if a_info["kind"] != "filled" or float(a_info.get("filled_size") or 0) <= 0:
         extra = f"，{a_info['reason']}" if a_info.get("reason") else ""
         _say(f"Arcus 未确认成交（{a_info['kind']}{extra}），Hyperliquid / Entropy 一腿未发送，避免单边仓。")

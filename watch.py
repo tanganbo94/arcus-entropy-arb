@@ -47,6 +47,8 @@ TP_MIN_LOCK_BP = 2.0           # 止盈：预计扣完平仓费后至少锁住�
 SL_MIN_ADVERSE_BP = 15.0       # 止损：价差相对开仓继续走阔至少 15bp，或 2 倍开仓净边（取更大）
 MARGIN_USE = 0.80              # 最多用掉可用保证金的 80%
 POLL_SECS = 12                 # 下单后等待成交确认的秒数
+BOUND_COOLDOWN_SECS = 30 * 60  # 盘后限幅挡住后，若没有扩档时间则至少冷却 30 分钟
+_bound_cooldown: dict[str, dict] = {}
 
 
 def now_sh() -> str:
@@ -423,11 +425,58 @@ def funding_net_bp(long_venue: str, a_fund: float, h_funding: float) -> float:
     return (-h_funding + a_fund) * 10_000
 
 
+
+def bound_cooldown_active(name: str) -> dict | None:
+    rec = _bound_cooldown.get(norm_coin(name))
+    if not rec:
+        return None
+    if time.time() >= float(rec.get("until") or 0):
+        _bound_cooldown.pop(norm_coin(name), None)
+        return None
+    return rec
+
+
+def bound_retry_until(market: dict, side: str) -> float:
+    b = t.arcus_offhours_bounds(market)
+    now = time.time()
+    exp = None
+    if b:
+        side_u = (side or "").upper()
+        if side_u == "BUY" and b.get("upper_in_zone") and b.get("upper_expand_at"):
+            exp = float(b["upper_expand_at"])
+        elif side_u == "SELL" and b.get("lower_in_zone") and b.get("lower_expand_at"):
+            exp = float(b["lower_expand_at"])
+    if exp and exp > now + 5:
+        return exp
+    return now + BOUND_COOLDOWN_SECS
+
+
+def note_bound_block(coin: str, market: dict, side: str, reason: str) -> None:
+    until = bound_retry_until(market, side)
+    _bound_cooldown[norm_coin(coin)] = {"until": until, "reason": reason, "side": side}
+    until_txt = datetime.fromtimestamp(until, TZ).strftime("%H:%M")
+    log(f"{coin} {reason}，价差锁不住，先跳过，最早 {until_txt}（Asia/Shanghai）后再看。")
+
+
+def maybe_clear_bound_cooldown(market: dict, *names: str) -> None:
+    if t.arcus_offhours_bounds(market) is None:
+        for n in names:
+            if n:
+                _bound_cooldown.pop(norm_coin(n), None)
+
+
+def _arcus_side_from_idea(idea: dict) -> str:
+    return "BUY" if idea.get("long") == "arcus" else "SELL"
+
+
 def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc, occupied: set[str] | None = None) -> dict | None:
     by_name = {m.get("marketDisplayName"): m for m in arcus_markets}
     occupied = {norm_coin(x) for x in (occupied or set()) if x}
     ranked = sorted(rows, key=lambda r: r.get("net_round_bps") or r.get("net_open_bps") or -999, reverse=True)
-    for r in ranked[:BOOK_CHECK_LIMIT]:
+    checked = 0
+    for r in ranked:
+        if checked >= BOOK_CHECK_LIMIT:
+            break
         ticker = r["ticker"]
         if occupied and (norm_coin(ticker) in occupied or norm_coin(r.get("arcus") or "") in occupied):
             continue
@@ -438,9 +487,22 @@ def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc, occupied: se
                 am = t.find_arcus_market(arcus_markets, ticker)
             except t.TradeError:
                 continue
+        maybe_clear_bound_cooldown(am, ticker, am_name)
+        if bound_cooldown_active(ticker) or bound_cooldown_active(am_name):
+            continue
+        mid_side = "BUY" if float(r.get("spread_bps") or 0) >= 0 else "SELL"
+        try:
+            mark = float(am.get("markPrice") or am.get("oraclePrice") or r.get("arcus_px") or 0)
+        except (TypeError, ValueError):
+            mark = 0.0
+        why = t.arcus_bound_block(am, mid_side, fill_px=mark or None)
+        if why:
+            note_bound_block(ticker, am, mid_side, why)
+            continue
         vol_a = arcus_vol(am)
         if vol_a and vol_a < args.min_vol:
             continue
+        checked += 1
         abook = arcus_book(am.get("marketDisplayName") or am_name)
         bids_a = abook.get("bids") or []
         asks_a = abook.get("asks") or []
@@ -467,6 +529,12 @@ def pick_candidate(args, keys, rows, arcus_markets, a_free, h_usdc, occupied: se
             fee = float(r.get("fee_open_bps") or 9.0)
             idea = idea_from_fill(wa_ask["fill"], wa_bid["fill"], wh_ask["fill"], wh_bid["fill"], fee)
             if not idea or idea["net_round_bps"] < args.min_net:
+                continue
+            arcus_side = _arcus_side_from_idea(idea)
+            fill = idea["buy_px"] if arcus_side == "BUY" else idea["sell_px"]
+            why = t.arcus_bound_block(am, arcus_side, fill_px=fill)
+            if why:
+                note_bound_block(ticker, am, arcus_side, why)
                 continue
             mid_idea = idea_from_fill(wa_ask["best"], wa_bid["best"], wh_ask["best"], wh_bid["best"], fee)
             # 中间价边远大于可成交边，多半是过时报价，丢掉
@@ -781,6 +849,12 @@ def one_round(keys, args) -> None:
     if args.dry_run:
         return
     if not result.get("ok"):
+        last = getattr(t, "LAST_OPEN_RESULT", None) or {}
+        reason = str(last.get("reason") or "")
+        if "TRADING_BOUND" in reason or "盘后" in reason:
+            am = next((m for m in markets if (m.get("marketDisplayName") == cand.get("arcus_name") or m.get("baseAsset") == cand.get("ticker"))), None) or {}
+            side = _arcus_side_from_idea(cand.get("idea") or {})
+            note_bound_block(cand.get("ticker") or cand.get("coin"), am, side, reason if "盘后" in reason else f"Arcus 拒单 {reason}")
         log("下单命令返回失败，开始核对是否出现单腿。")
     status, detail = wait_and_reconcile(keys, cand)
     log(f"成交核对：{status}")
