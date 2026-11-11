@@ -314,6 +314,117 @@ def qty_equal(a, b) -> bool:
         return str(a) == str(b)
 
 
+_watcher_log = None
+
+
+def set_watcher_log(fn) -> None:
+    global _watcher_log
+    _watcher_log = fn
+
+
+def _say(msg: str) -> None:
+    print(msg)
+    hook = _watcher_log
+    if hook:
+        try:
+            hook(msg)
+        except Exception:
+            pass
+
+
+def open_fill_info(venue: str, body) -> dict:
+    """解析开仓回报。kind: filled / unfilled / rejected / pending / unknown。"""
+    info = {"kind": "unknown", "filled_size": 0.0, "reason": ""}
+    if body is None:
+        info["reason"] = "empty"
+        return info
+    venue_l = (venue or "").lower()
+    if venue_l == "arcus":
+        if not isinstance(body, dict):
+            info["reason"] = f"non-dict:{type(body).__name__}"
+            return info
+        st = str(body.get("status") or "").upper()
+        reason = str(body.get("rejectionReason") or body.get("reason") or "")
+        try:
+            filled = float(body.get("filledSize") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled <= 0 and st == "FILLED":
+            try:
+                qty = float(body.get("quantity") or 0)
+                rem = float(body.get("remainingSize") or 0)
+                if qty - rem > 0:
+                    filled = qty - rem
+            except (TypeError, ValueError):
+                pass
+        info["filled_size"] = filled
+        info["reason"] = reason or st
+        if filled > 0 or st == "FILLED":
+            info["kind"] = "filled"
+            return info
+        if st in {"REJECTED", "FAILED"}:
+            info["kind"] = "rejected"
+            return info
+        if st in {"CANCELED", "CANCELLED", "EXPIRED", "IOC_EXPIRED"}:
+            info["kind"] = "unfilled"
+            return info
+        if st in {"OPEN", "NEW", "PENDING", "ACCEPTED", "RESTING", "PARTIALLY_FILLED", "SUBMITTED"}:
+            info["kind"] = "pending"
+            return info
+        return info
+
+    text = json.dumps(body, ensure_ascii=False, default=str)
+    if not isinstance(body, dict):
+        info["reason"] = text[:200]
+        if "error" in text.lower():
+            info["kind"] = "rejected"
+        return info
+    top = str(body.get("status") or "")
+    try:
+        statuses = (((body.get("response") or {}).get("data") or {}).get("statuses") or [])
+    except AttributeError:
+        statuses = []
+    filled_sz = 0.0
+    errors = []
+    resting = False
+    for stt in statuses:
+        if not isinstance(stt, dict):
+            continue
+        fd = stt.get("filled")
+        if fd:
+            try:
+                filled_sz += float(fd.get("totalSz") or fd.get("sz") or 0)
+            except (TypeError, ValueError, AttributeError):
+                pass
+        if stt.get("error"):
+            errors.append(str(stt.get("error")))
+        if stt.get("resting"):
+            resting = True
+    if filled_sz > 0:
+        info["kind"] = "filled"
+        info["filled_size"] = filled_sz
+        info["reason"] = "filled"
+        return info
+    if errors:
+        info["kind"] = "rejected"
+        info["reason"] = "; ".join(errors)[:300]
+        return info
+    if top and top not in ("ok",):
+        info["kind"] = "rejected"
+        info["reason"] = text[:200]
+        return info
+    if resting:
+        info["kind"] = "pending"
+        info["reason"] = "resting"
+        return info
+    if "error" in text.lower() and "filled" not in text.lower():
+        info["kind"] = "rejected"
+        info["reason"] = text[:200]
+        return info
+    info["reason"] = text[:200]
+    return info
+
+
 def snap_decimal(value, unit, rounding=ROUND_HALF_UP) -> Decimal:
     step = Decimal(str(unit))
     n = Decimal(str(value)) / step
@@ -963,12 +1074,12 @@ def cmd_plan_or_live(keys: Keys, args) -> int:
 
 def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
     # 上面那次「腿 1」可能顺序混乱，这里重新完整打印两腿。
-    print("—— 将发送的两腿（完整）——")
+    _say("—— 将发送的两腿（完整）——")
     for label, planned in (("Arcus", a_ord), ("Hyperliquid", h_ord)):
         print(f"\n[{label}]")
         print_planned(planned)
     if not qty_equal(a_ord["size"], h_ord["size"]):
-        print(f"\n拒绝下单：两边数量仍不一致（Arcus {a_ord['size']} vs HL {h_ord['size']}），不对冲。")
+        _say(f"\n拒绝下单：两边数量仍不一致（Arcus {a_ord['size']} vs HL {h_ord['size']}），不对冲。")
         return 2
     if not live:
         print("\n这是干跑，订单没有发送。确认无误后再使用：")
@@ -980,25 +1091,47 @@ def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
         print("请先在对话里确认，再运行带 --live --i-confirm 的命令。")
         return 0
 
-    print("\n开始发送两腿订单（已带 --live --i-confirm）…")
+    _say("\n开始发送两腿订单（已带 --live --i-confirm）…")
     results = {}
-    # 先下多腿再下空腿，失败时把已发送的回执打印出来，不自动撤单（避免误操作）。
+    # 先下 Arcus，只有确认成交后才下 Entropy；避免再出现一边空、一边有仓。
     try:
         results["arcus"] = arcus_place(keys, a_ord)
-        print("Arcus 已受理：", redact(json.dumps(results["arcus"], ensure_ascii=False, default=str)[:800]))
+        _say("Arcus 回报：" + redact(json.dumps(results["arcus"], ensure_ascii=False, default=str)[:800]))
     except Exception as e:
-        print("Arcus 下单失败：", redact(str(e)))
-        print("Hyperliquid 一腿未发送。")
+        _say("Arcus 下单失败：" + redact(str(e)))
+        _say("Hyperliquid / Entropy 一腿未发送。")
         return 1
+
+    a_info = open_fill_info("arcus", results["arcus"])
+    if a_info["kind"] != "filled" or float(a_info.get("filled_size") or 0) <= 0:
+        extra = f"，{a_info['reason']}" if a_info.get("reason") else ""
+        _say(f"Arcus 未确认成交（{a_info['kind']}{extra}），Hyperliquid / Entropy 一腿未发送，避免单边仓。")
+        return 1
+
+    if not qty_equal(a_info["filled_size"], h_ord["size"]):
+        _say(f"Arcus 只成交 {a_info['filled_size']}，Entropy 按同一数量下单。")
+        try:
+            h_ord = hl_build_order(hm, h_ord["side"], a_info["filled_size"], args.price, keys.hl_account_address)
+        except Exception as e:
+            _say("按 Arcus 成交数量重算 Entropy 订单失败：" + redact(str(e)))
+            _say("注意：Arcus 可能已成交。盯盘将按单腿处理。")
+            return 1
+
     try:
         perp_dexs = ["" if n == "hl" else n for _, n in dexs]
         results["hl"] = hl_place(keys, h_ord, perp_dexs)
-        print("Hyperliquid 已受理：", redact(json.dumps(results["hl"], ensure_ascii=False, default=str)[:800]))
+        _say("Hyperliquid / Entropy 回报：" + redact(json.dumps(results["hl"], ensure_ascii=False, default=str)[:800]))
     except Exception as e:
-        print("Hyperliquid 下单失败：", redact(str(e)))
-        print("注意：Arcus 那一腿可能已经提交。本脚本不会自动撤单，请立刻在网页或自行确认后处理。")
+        _say("Hyperliquid / Entropy 下单失败：" + redact(str(e)))
+        _say("注意：Arcus 那一腿可能已经成交。盯盘将核对并尝试平掉单腿。")
         return 1
-    print("两腿均已提交（Arcus 为异步受理，最终状态请以网页或后续 --status 为准）。")
+
+    h_info = open_fill_info("hl", results["hl"])
+    if h_info["kind"] != "filled" or float(h_info.get("filled_size") or 0) <= 0:
+        extra = f"，{h_info['reason']}" if h_info.get("reason") else ""
+        _say(f"Hyperliquid / Entropy 未确认成交（{h_info['kind']}{extra}）。Arcus 可能已成交，盯盘将按单腿处理。")
+        return 1
+    _say("两腿均已确认成交。")
     return 0
 
 

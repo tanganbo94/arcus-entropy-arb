@@ -46,7 +46,7 @@ DEFAULT_MIN_VOL = 500_000.0    # 24h 成交额下限（USD），过低视为过�
 TP_MIN_LOCK_BP = 2.0           # 止盈：预计扣完平仓费后至少锁住这么多净边
 SL_MIN_ADVERSE_BP = 15.0       # 止损：价差相对开仓继续走阔至少 15bp，或 2 倍开仓净边（取更大）
 MARGIN_USE = 0.80              # 最多用掉可用保证金的 80%
-POLL_SECS = 8                  # 下单后等待成交确认的秒数
+POLL_SECS = 12                 # 下单后等待成交确认的秒数
 
 
 def now_sh() -> str:
@@ -204,23 +204,62 @@ def hl_spot_usdc(keys) -> float:
     return 0.0
 
 
-def hl_positions(keys) -> list[dict]:
+def hl_dex_names_to_query() -> list:
+    """主盘 + 各 HIP-3（至少包含 Entropy 的 xyz）。None 表示 Hyperliquid 主盘。"""
+    names = []
     try:
-        ch = t.hl_post({"type": "clearinghouseState", "user": keys.hl_account_address}) or {}
+        for _idx, name in t.hl_dex_list():
+            names.append(None if name in (None, "", "hl") else name)
     except Exception:
-        return []
+        names = [None]
+    if "xyz" not in names:
+        names.append("xyz")
     out = []
-    for p in ch.get("assetPositions") or []:
-        pos = p.get("position") if isinstance(p, dict) else None
-        if not isinstance(pos, dict):
-            continue
+    seen = set()
+    for n in names:
+        key = n or "hl"
+        if key not in seen:
+            seen.add(key)
+            out.append(n)
+    return out
+
+
+def hl_positions(keys) -> list[dict]:
+    """读取 Hyperliquid 主盘和 Entropy（xyz）等 dex 的仓位。查不到 Entropy 时抛错，避免误判空仓。"""
+    out = []
+    errors = []
+    xyz_ok = False
+    for dex in hl_dex_names_to_query():
+        payload = {"type": "clearinghouseState", "user": keys.hl_account_address}
+        if dex:
+            payload["dex"] = dex
         try:
-            szi = float(pos.get("szi") or 0)
-        except (TypeError, ValueError):
-            szi = 0.0
-        if szi == 0:
+            ch = t.hl_post(payload) or {}
+        except Exception as e:
+            errors.append((dex or "hl", e))
             continue
-        out.append(pos)
+        if dex == "xyz":
+            xyz_ok = True
+        if not isinstance(ch, dict):
+            continue
+        for p in ch.get("assetPositions") or []:
+            pos = p.get("position") if isinstance(p, dict) else None
+            if not isinstance(pos, dict):
+                continue
+            try:
+                szi = float(pos.get("szi") or 0)
+            except (TypeError, ValueError):
+                szi = 0.0
+            if szi == 0:
+                continue
+            pos = dict(pos)
+            coin = str(pos.get("coin") or "")
+            if dex and ":" not in coin:
+                pos["coin"] = f"{dex}:{coin}"
+            out.append(pos)
+    if not xyz_ok:
+        detail = "; ".join(f"{d}: {e}" for d, e in errors) or "未返回 Entropy 账本"
+        raise RuntimeError(f"查询 Entropy（xyz）仓位失败：{detail}")
     return out
 
 
@@ -518,11 +557,13 @@ def wait_and_reconcile(keys, cand: dict) -> tuple[str, dict]:
     """返回 (status, detail)。status: both / one_arcus / one_hl / none / unknown"""
     deadline = time.time() + POLL_SECS
     last = {"arcus": [], "hl": []}
+    saw = False
     while time.time() < deadline:
         time.sleep(1.5)
         try:
             last["arcus"] = arcus_positions(keys, fresh=True)
             last["hl"] = hl_positions(keys)
+            saw = True
         except Exception as e:
             note_arcus_limit(e)
             log(f"查询持仓失败：{e}")
@@ -537,6 +578,9 @@ def wait_and_reconcile(keys, cand: dict) -> tuple[str, dict]:
             continue
         if h_on and not a_on:
             continue
+    if not saw:
+        log("成交核对期间一直没查到仓位，不能当成两腿都没成交。")
+        return "unknown", last
     coin = cand["coin"]
     a_on = bool(legs_on_coin(last["arcus"], coin))
     h_on = bool(legs_on_coin(last["hl"], coin))
@@ -724,8 +768,10 @@ def one_round(keys, args) -> None:
         return
     try:
         occupied = open_coins(arcus_positions(keys)) | open_coins(hl_positions(keys))
-    except Exception:
-        occupied = set()
+    except Exception as e:
+        note_arcus_limit(e)
+        log(f"读仓位失败，本轮不开新仓：{e}")
+        return
     cand = pick_candidate(args, keys, rows, markets, a_free, h_usdc, occupied)
     if not cand:
         log(f"本轮没有同时满足「扣费+滑点后 ≥ {args.min_net}bp、盘口够深、资金费吃不完」的机会。保证金 Arcus {a_free:.2f} / Entropy USDC {h_usdc:.2f}")
@@ -789,6 +835,7 @@ def one_round(keys, args) -> None:
 
 def main(argv=None) -> int:
     t._win_utf8()
+    t.set_watcher_log(log)
     p = argparse.ArgumentParser(description="本地循环：扫同名价差并在本机下对冲单")
     p.add_argument("--dry-run", action="store_true", help="只扫描不下单")
     p.add_argument("--once", action="store_true", help="只跑一轮")
