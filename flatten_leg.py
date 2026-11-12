@@ -18,6 +18,7 @@ import trade as t
 
 
 def arcus_build_reduce(keys, market, side, size) -> dict:
+    # 保护限价由 arcus_build_order / snap_close_limit 按交易所 tick 取整，且不越过盘后限幅。
     planned = t.arcus_build_order(keys, market, side, size, price=None)
     # flip reduce-only in typed payload and HTTP body
     payload = planned["_payload"]

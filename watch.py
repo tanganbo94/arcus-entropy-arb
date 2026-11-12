@@ -48,6 +48,7 @@ SL_MIN_ADVERSE_BP = 15.0       # 止损：价差相对开仓继续走阔至少 1
 MARGIN_USE = 0.80              # 最多用掉可用保证金的 80%
 POLL_SECS = 12                 # 下单后等待成交确认的秒数
 BOUND_COOLDOWN_SECS = 30 * 60  # 盘后限幅挡住后，若没有扩档时间则至少冷却 30 分钟
+PENDING_FLAT_MODE = "pending_flat_confirm"  # 两腿平仓单已回报成交，只查仓、不再下单
 _bound_cooldown: dict[str, dict] = {}
 
 
@@ -682,15 +683,27 @@ def flatten_venue(keys, venue: str, coin: str, close_side: str, size: float) -> 
         log(f"{venue} reduce-only 已提交：{redact(json.dumps(body, ensure_ascii=False, default=str)[:500])}")
         invalidate_arcus_status()
         kind = classify_reduce_result(venue, body)
+        info = t.open_fill_info("arcus" if venue == "arcus" else "hl", body)
+        avg = info.get("avg_px")
+        src = info.get("avg_px_source") or "missing"
+        if venue == "arcus" and kind == "filled" and avg is None:
+            resolved = t.resolve_arcus_avg_px(keys, body, retries=1)
+            avg = resolved.get("avg_px")
+            src = resolved.get("avg_px_source") or "missing"
+        if kind == "filled":
+            if avg is not None:
+                log(f"{venue} 平仓真实均价 {t.fnum(avg)}（来源 {src}），不是保护限价。")
+            else:
+                log(f"{venue} 平仓真实均价缺失，不会把保护限价当作均价。")
         if kind == "rejected":
             log(f"{venue} 平仓单被拒绝，不能当成已成交。")
-            return False
+            return "rejected"
         if kind == "already_flat":
             log(f"{venue} reduce-only 提示已无该方向仓位，等持仓核对确认。")
-        return kind in ("filled", "already_flat", "unknown")
+        return kind if kind in ("filled", "already_flat", "unknown") else "failed"
     except Exception as e:
         log(f"{venue} 平仓失败：{e}")
-        return False
+        return "failed"
 
 
 def flatten_one_leg(keys, cand: dict, status: str, detail: dict) -> None:
@@ -714,30 +727,75 @@ def flatten_one_leg(keys, cand: dict, status: str, detail: dict) -> None:
         flatten_venue(keys, "hl", coin, close_side, size)
 
 
+def mark_pending_flat(state: dict, reason: str, a_kind: str = "", h_kind: str = "") -> None:
+    """两腿平仓单已回报成交（或已提交），先标待核对已平：只查仓、不再下单，也不立刻连查。"""
+    st = dict(state or {})
+    st["mode"] = PENDING_FLAT_MODE
+    st["pending_flat_reason"] = reason
+    st["pending_flat_at"] = now_sh()
+    if a_kind:
+        st["close_arcus_kind"] = a_kind
+    if h_kind:
+        st["close_hl_kind"] = h_kind
+    save_state(st)
+    log(
+        f"标为待核对已平（{st.get('coin')}）。本轮不再查仓、不再发 reduce-only；"
+        f"下一轮只核对持仓。Arcus={a_kind or '—'} Entropy={h_kind or '—'}。"
+    )
+
+
+def confirm_pending_flat(keys, state: dict) -> None:
+    """待核对已平：只查仓、不再下单。429/读失败就等下一轮，不要把查不到当成还在持仓去再平。"""
+    coin = state["coin"]
+    log(f"待核对已平（{coin}）：只查仓，不发 reduce-only。")
+    try:
+        a_pos = arcus_positions(keys, fresh=True)
+        h_pos = hl_positions(keys)
+    except Exception as e:
+        note_arcus_limit(e)
+        log(f"仓位检查失败，本轮跳过。待核对已平，等下一轮再查：{e}")
+        return
+    a_on = bool(legs_on_coin(a_pos, coin))
+    h_on = bool(legs_on_coin(h_pos, coin))
+    if not a_on and not h_on:
+        log("两边已平仓（待核对已确认）。")
+        save_state(None)
+        return
+    if a_on and h_on:
+        # 查询成功且两边仍在，才允许后续再走平仓；429 路径不会进这里。
+        log(f"待核对后发现 {coin} 两边仍有仓。留下残留记录，下一轮再平，本轮不再下单。")
+        st = dict(state)
+        st["mode"] = "flatten_residual"
+        save_state(st)
+        return
+    status = "one_arcus" if a_on else "one_hl"
+    log(
+        f"待核对后 {coin} 仍有单腿：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。"
+        "只平残留那一腿。"
+    )
+    flatten_one_leg(keys, state, status, {"arcus": a_pos, "hl": h_pos})
+    mark_pending_flat(state, "单腿平仓已提交，待核对", status, "")
+
+
 def close_both(keys, state: dict, reason: str) -> None:
     log(f"开始双边平仓（{reason}）")
     coin = state["coin"]
     idea = state["idea"]
     size = float(state.get("size") or 0)
-    # Arcus
     a_side = "SELL" if idea["long"] == "arcus" else "BUY"
-    flatten_venue(keys, "arcus", coin, a_side, size)
-    # HL
+    a_kind = flatten_venue(keys, "arcus", coin, a_side, size)
     h_side = "SELL" if idea["long"] == "hl" else "BUY"
-    flatten_venue(keys, "hl", coin, h_side, size)
-    time.sleep(2)
-    try:
-        a_on = bool(legs_on_coin(arcus_positions(keys, fresh=True), coin))
-        h_on = bool(legs_on_coin(hl_positions(keys), coin))
-        if not a_on and not h_on:
-            log("两边已平仓。")
-            save_state(None)
-            return True
-        log(f"平仓后对冲品种 {coin} 仍有仓位：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。本轮先不新开，下一轮继续平。")
+    h_kind = flatten_venue(keys, "hl", coin, h_side, size)
+    acked = {"filled", "already_flat"}
+    # 不论成败，平仓后都不立刻连查仓位（容易 429）。先信订单回报，下一轮再核对。
+    if a_kind in acked and h_kind in acked:
+        mark_pending_flat(state, reason, a_kind, h_kind)
+        return True
+    if a_kind in acked or h_kind in acked:
+        mark_pending_flat(state, f"{reason}（一腿未确认）", a_kind, h_kind)
         return False
-    except Exception as e:
-        log(f"平仓后核对失败：{e}。先不清掉本地对冲记录。")
-        return False
+    log(f"两边平仓单都没有确认成交（Arcus={a_kind} Entropy={h_kind}），保留对冲记录，下一轮再试。先不连查仓位。")
+    return False
 
 
 def manage_open(keys, state: dict, args) -> None:
@@ -790,26 +848,38 @@ def manage_open(keys, state: dict, args) -> None:
         log(f"持仓管理出错：{e}")
 
 
-def already_in_market(keys) -> bool:
-    """只有两边同品种、像未记录的对冲时才拦住新开仓。单向残留仓不会挡住其他品种的套利。"""
+def position_check(keys) -> tuple[str, set]:
+    """返回 ('empty'|'occupied'|'error', 两边同品种币集合)。读失败要 fail-safe 跳过开仓，但不得说成已有仓位。"""
     try:
         a = open_coins(arcus_positions(keys))
         h = open_coins(hl_positions(keys))
         both = a & h
         if both:
-            log("发现两边同品种仓位但本地没有对冲记录：" + "、".join(sorted(both)) + "。本轮只观察，避免重复开对冲。")
-            return True
-        return False
+            return "occupied", both
+        return "empty", set()
     except Exception as e:
         note_arcus_limit(e)
-        log(f"检查是否已有仓位失败：{e}")
-        return True  # 不确定时不要再开新仓
+        log(f"仓位检查失败，本轮跳过：{e}")
+        return "error", set()
+
+
+def already_in_market(keys) -> bool:
+    """只有两边同品种、像未记录的对冲时才拦住新开仓。读失败不算已有仓位（见 position_check）。"""
+    status, both = position_check(keys)
+    if status == "occupied":
+        log("发现两边同品种仓位但本地没有对冲记录：" + "、".join(sorted(both)) + "。本轮只观察，避免重复开对冲。")
+        return True
+    if status == "error":
+        return True  # 文案已是「仓位检查失败，本轮跳过」，fail-safe 不开仓
+    return False
 
 
 def one_round(keys, args) -> None:
     state = load_state()
     if state and not args.dry_run:
-        if state.get("mode") == "flatten_residual":
+        if state.get("mode") == PENDING_FLAT_MODE:
+            confirm_pending_flat(keys, state)
+        elif state.get("mode") == "flatten_residual":
             close_both(keys, state, f"补平单腿残留 {state.get('coin')}")
         else:
             manage_open(keys, state, args)
@@ -818,11 +888,21 @@ def one_round(keys, args) -> None:
         # 已平仓则本轮不再立刻开新仓，下一轮再扫
         return
 
-    if not args.dry_run and already_in_market(keys) and not state:
-        log("账户里已有仓位，但本地没有记录。为避免重复开仓，本轮只观察，请先在网页核对或删掉多余仓位。")
-        return
+    if not args.dry_run and not state:
+        occ, both = position_check(keys)
+        if occ == "error":
+            # position_check 已打「仓位检查失败，本轮跳过」
+            return
+        if occ == "occupied":
+            log("发现两边同品种仓位但本地没有对冲记录：" + "、".join(sorted(both)) + "。本轮只观察，避免重复开对冲。")
+            return
 
-    snap = scan_mod.fetch_snapshot()
+    try:
+        snap = scan_mod.fetch_snapshot()
+    except Exception as e:
+        note_arcus_limit(e)
+        log(f"拉市场快照失败，本轮跳过：{e}")
+        return
     rows = scan_mod.build_rows(*snap)
     markets = snap[0] or []
     a_free = 0.0
@@ -859,6 +939,21 @@ def one_round(keys, args) -> None:
     status, detail = wait_and_reconcile(keys, cand)
     log(f"成交核对：{status}")
     if status == "both":
+        last = getattr(t, "LAST_OPEN_RESULT", None) or {}
+        a_avg = last.get("arcus_avg_px")
+        h_avg = last.get("hl_avg_px")
+        if a_avg is None and isinstance(last.get("arcus"), dict):
+            a_avg = last["arcus"].get("avg_px")
+        if h_avg is None and isinstance(last.get("hl"), dict):
+            h_avg = last["hl"].get("avg_px")
+        for line in t.fill_edge_warning(
+            cand["idea"].get("raw_bps"),
+            cand["idea"].get("long"),
+            a_avg,
+            h_avg,
+            fee_open=cand["idea"].get("fee_open") or cand.get("fee_open"),
+        ):
+            log(line)
         st = {
             "opened_at": now_sh(),
             "coin": cand["coin"],
@@ -870,6 +965,8 @@ def one_round(keys, args) -> None:
             "entry_net_bps": cand["idea"]["net_bps"],
             "fee_open": cand["idea"].get("fee_open") or cand.get("fee_open") or 9.0,
             "hl_funding": 0,
+            "arcus_avg_px": a_avg,
+            "hl_avg_px": h_avg,
         }
         save_state(st)
         sl = max(SL_MIN_ADVERSE_BP, 2.0 * abs(st["entry_net_bps"]))
@@ -880,26 +977,18 @@ def one_round(keys, args) -> None:
         )
     elif status in ("one_arcus", "one_hl"):
         flatten_one_leg(keys, cand, status, detail)
-        time.sleep(2)
-        a_on = bool(legs_on_coin(arcus_positions(keys, fresh=True), cand["coin"]))
-        h_on = bool(legs_on_coin(hl_positions(keys), cand["coin"]))
-        if a_on or h_on:
-            log(f"单腿平仓后 {cand['coin']} 仍有仓：Arcus={'有' if a_on else '无'}  HL={'有' if h_on else '无'}。留下记录，下一轮继续平，不开新仓。")
-            save_state({
-                "opened_at": now_sh(),
-                "coin": cand["coin"],
-                "ticker": cand["ticker"],
-                "idea": cand["idea"],
-                "size": cand["size"],
-                "notional": cand["notional"],
-                "mode": "flatten_residual",
-                "entry_raw_bps": cand["idea"]["raw_bps"],
-                "entry_net_bps": cand["idea"]["net_bps"],
-                "fee_open": cand["idea"].get("fee_open") or cand.get("fee_open") or 9.0,
-            })
-        else:
-            log(f"单腿 {cand['coin']} 已确认平掉。")
-            save_state(None)
+        # 平仓后不立刻连查，先标待核对已平，下一轮只查仓。
+        mark_pending_flat({
+            "opened_at": now_sh(),
+            "coin": cand["coin"],
+            "ticker": cand["ticker"],
+            "idea": cand["idea"],
+            "size": cand["size"],
+            "notional": cand["notional"],
+            "entry_raw_bps": cand["idea"]["raw_bps"],
+            "entry_net_bps": cand["idea"]["net_bps"],
+            "fee_open": cand["idea"].get("fee_open") or cand.get("fee_open") or 9.0,
+        }, f"开仓后单腿 {status} 已提交平仓", status, "")
     elif status == "none":
         log("两腿都没有成交（可能是 IOC 未撮合），不开仓。")
         save_state(None)

@@ -24,10 +24,30 @@ HL_TAKER_BPS_DEFAULT = 9.0
 # 资金费率展示按「当期」原样输出（两边都接近按小时计），不年化。
 
 
+class SnapshotError(Exception):
+    """拉行情快照失败。盯盘应退避后继续跑，不要把完整 traceback 当致命错误打出来。"""
+
+
+def _open_json(req, timeout: int = 20):
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode() or "null")
+    except urllib.error.HTTPError as e:
+        code = getattr(e, "code", None)
+        if code == 429:
+            raise SnapshotError(f"HTTP 429 限速：{e.reason or 'Too Many Requests'}") from None
+        raise SnapshotError(f"HTTP {code}：{e.reason or e}") from None
+    except TimeoutError as e:
+        raise SnapshotError(f"超时：{e}") from None
+    except urllib.error.URLError as e:
+        reason = e.reason if hasattr(e, "reason") else e
+        kind = "超时" if "timed out" in str(reason).lower() or "timeout" in str(reason).lower() else "网络失败"
+        raise SnapshotError(f"{kind}：{reason}") from None
+
+
 def http_get_json(url: str, timeout: int = 20):
     req = urllib.request.Request(url, headers={"User-Agent": "arcus-entropy-arb/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return _open_json(req, timeout=timeout)
 
 
 def hl_post(payload: dict, timeout: int = 20):
@@ -38,8 +58,7 @@ def hl_post(payload: dict, timeout: int = 20):
         headers={"Content-Type": "application/json", "User-Agent": "arcus-entropy-arb/1.0"},
         method="POST",
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode())
+    return _open_json(req, timeout=timeout)
 
 
 def norm_ticker(name: str) -> str:
@@ -238,7 +257,7 @@ def main():
     def once():
         try:
             snap = fetch_snapshot()
-        except urllib.error.URLError as e:
+        except (SnapshotError, urllib.error.URLError, TimeoutError, OSError) as e:
             print(f"拉行情失败：{e}", file=sys.stderr)
             return 1
         rows = build_rows(*snap)

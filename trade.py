@@ -333,9 +333,361 @@ def _say(msg: str) -> None:
             pass
 
 
+def _first_pos_num(*vals):
+    for v in vals:
+        if v is None or v == "":
+            continue
+        if isinstance(v, dict):
+            continue
+        try:
+            n = float(v)
+        except (TypeError, ValueError):
+            continue
+        if n > 0:
+            return n
+    return None
+
+
+def order_id_of(body) -> str | None:
+    if not isinstance(body, dict):
+        return None
+    for k in ("orderId", "order_id", "id", "oid"):
+        v = body.get(k)
+        if v not in (None, ""):
+            return str(v)
+    try:
+        statuses = (((body.get("response") or {}).get("data") or {}).get("statuses") or [])
+    except AttributeError:
+        statuses = []
+    for stt in statuses:
+        if not isinstance(stt, dict):
+            continue
+        fd = stt.get("filled") or stt.get("resting") or {}
+        if isinstance(fd, dict) and fd.get("oid") not in (None, ""):
+            return str(fd.get("oid"))
+    return None
+
+
+# 这些字段才是成交均价。order 上的 price / limitPrice 是限价或市价保护限价，不能当均价。
+_AVG_PX_KEYS = (
+    "avgFillPrice",
+    "avg_fill_price",
+    "averageFillPrice",
+    "average_fill_price",
+    "avgPx",
+    "avg_px",
+)
+EDGE_SLIP_WARN_BP = 5.0
+
+
+def extract_arcus_avg_px(body) -> tuple[float | None, str]:
+    """只从均价字段或 filledNotional/filledSize 取 VWAP，绝不使用 price 保护限价。"""
+    if not isinstance(body, dict):
+        return None, "missing"
+    for k in _AVG_PX_KEYS:
+        n = _first_pos_num(body.get(k))
+        if n is not None:
+            return n, k
+    notion = _first_pos_num(body.get("filledNotional"), body.get("filled_notional"), body.get("cumNotional"))
+    size = _first_pos_num(body.get("filledSize"), body.get("filled_size"))
+    if notion is not None and size:
+        return notion / size, "filledNotional/filledSize"
+    return None, "missing"
+
+
+def extract_hl_avg_px(body) -> tuple[float | None, str]:
+    """从 Hyperliquid / Entropy 回报里取加权均价（avgPx），不用限价。"""
+    if not isinstance(body, dict):
+        return None, "missing"
+    for k in _AVG_PX_KEYS:
+        n = _first_pos_num(body.get(k))
+        if n is not None:
+            return n, k
+    try:
+        statuses = (((body.get("response") or {}).get("data") or {}).get("statuses") or [])
+    except AttributeError:
+        statuses = []
+    notion = 0.0
+    size = 0.0
+    for stt in statuses:
+        if not isinstance(stt, dict):
+            continue
+        fd = stt.get("filled")
+        if not isinstance(fd, dict):
+            continue
+        try:
+            sz = float(fd.get("totalSz") or fd.get("sz") or 0)
+        except (TypeError, ValueError):
+            continue
+        px = None
+        if fd.get("avgPx") not in (None, "", 0, "0"):
+            try:
+                px = float(fd.get("avgPx"))
+            except (TypeError, ValueError):
+                px = None
+        elif fd.get("px") not in (None, "", 0, "0"):
+            # 单笔成交价（不是订单保护限价）
+            try:
+                px = float(fd.get("px"))
+            except (TypeError, ValueError):
+                px = None
+        if sz > 0 and px and px > 0:
+            notion += sz * px
+            size += sz
+    if size > 0 and notion > 0:
+        return notion / size, "avgPx"
+    return None, "missing"
+
+
+def extract_avg_fill_px(venue: str, body) -> tuple[float | None, str]:
+    venue_l = (venue or "").lower()
+    if venue_l == "arcus":
+        return extract_arcus_avg_px(body)
+    return extract_hl_avg_px(body)
+
+
+def avg_px_from_fills(fills, order_id) -> tuple[float | None, str]:
+    """用成交明细按 orderId 加权均价。fill['price'] 是成交价，不是订单保护限价。"""
+    if not order_id:
+        return None, "missing"
+    rows = fills
+    if isinstance(fills, dict):
+        rows = fills.get("fills") or fills.get("data") or fills.get("trades") or []
+    if not isinstance(rows, list):
+        return None, "missing"
+    want = str(order_id)
+    notion = 0.0
+    size = 0.0
+    for f in rows:
+        if not isinstance(f, dict):
+            continue
+        oid = f.get("orderId") or f.get("order_id") or f.get("oid")
+        if str(oid) != want:
+            continue
+        try:
+            sz = float(f.get("size") or f.get("sz") or f.get("qty") or 0)
+            px = float(f.get("price") or f.get("px") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sz > 0 and px > 0:
+            notion += sz * px
+            size += sz
+    if size > 0 and notion > 0:
+        return notion / size, "fills"
+    return None, "missing"
+
+
+def format_planned_line(planned: dict) -> str:
+    if not isinstance(planned, dict):
+        return "（空）"
+    typ = planned.get("type") or ""
+    tif = planned.get("tif") or ""
+    kind = f"{typ}/{tif}" if typ and tif else (typ or tif or "—")
+    ro = "  reduce-only" if planned.get("reduce_only") else ""
+    venue = planned.get("venue") or ""
+    market = planned.get("market") or planned.get("_coin") or ""
+    side = planned.get("side") or ""
+    size = planned.get("size") or ""
+    px = planned.get("price") or "—"
+    mark = planned.get("mark") or "—"
+    return (
+        f"{venue} {market} {side} {kind} 数量 {size} "
+        f"限价/保护限价 {px} 标记 {mark}{ro}"
+    )
+
+
+def format_planned_legs(a_ord, h_ord) -> str:
+    return "—— 将发送的两腿（完整）——\n  " + format_planned_line(a_ord) + "\n  " + format_planned_line(h_ord)
+
+
+def market_price_tick(market: dict | None):
+    """取交易所价格步长。若同时给出多个字段，用更粗的那个，避免过细 tick 被拒。"""
+    ticks = []
+    if market:
+        for k in ("tickSize", "priceIncrement", "priceTickSize", "quoteTickSize"):
+            v = market.get(k)
+            if v in (None, "", 0, "0"):
+                continue
+            try:
+                d = Decimal(str(v))
+            except Exception:
+                continue
+            if d > 0:
+                ticks.append(d)
+    if not ticks:
+        return Decimal("0.00000001")
+    return max(ticks)
+
+
+def snap_close_limit(price, tick, is_buy: bool, market: dict | None = None):
+    """平仓/单腿平仓限价按 tick 取整：买单向上、卖单向下（更容易成交），且不越过盘后限幅。"""
+    tick_d = Decimal(str(tick)) if tick not in (None, "", 0, "0") else Decimal("0.00000001")
+    if tick_d <= 0:
+        tick_d = Decimal("0.00000001")
+    raw = Decimal(str(price))
+    rounding = ROUND_CEILING if is_buy else ROUND_FLOOR
+    px = snap_decimal(raw, tick_d, rounding=rounding)
+    if px <= 0:
+        raise TradeError(f"平仓限价按 tick {dec_str(tick_d)} 对齐后为 0。")
+    mid_d = raw
+    if market:
+        mid = market.get("markPrice") or market.get("oraclePrice") or market.get("lastTradePrice") or price
+        try:
+            mid_d = Decimal(str(mid))
+        except Exception:
+            mid_d = raw
+        px = apply_arcus_offhours_limit(market, is_buy, mid_d, px, tick_d)
+        if arcus_offhours_bounds(market):
+            # 限幅内再向不越界的一侧取整
+            inward = ROUND_FLOOR if is_buy else ROUND_CEILING
+            px = snap_decimal(px, tick_d, rounding=inward)
+            px = apply_arcus_offhours_limit(market, is_buy, mid_d, px, tick_d)
+    remainder = (px / tick_d) - (px / tick_d).to_integral_value()
+    if remainder != 0:
+        raise TradeError(f"平仓限价 {dec_str(px)} 不是 tick {dec_str(tick_d)} 的整数倍。")
+    return px
+
+
+def realized_open_raw_bps(long_venue: str, arcus_avg, hl_avg):
+    """用真实均价回算开仓可成交边（bp）。缺均价时返回 None。"""
+    try:
+        a = float(arcus_avg)
+        h = float(hl_avg)
+    except (TypeError, ValueError):
+        return None
+    if a <= 0 or h <= 0:
+        return None
+    mid = (a + h) / 2.0
+    if mid <= 0:
+        return None
+    if (long_venue or "").lower() in {"arcus", "a"}:
+        return (h - a) / mid * 10_000
+    return (a - h) / mid * 10_000
+
+
+def fill_edge_warning(planned_raw_bps, long_venue, arcus_avg, hl_avg, fee_open=None, warn_bp: float = EDGE_SLIP_WARN_BP) -> list:
+    """成交核对后的告警文案。均价缺失或实际边比计划差 warn_bp 以上时给出明显告警。"""
+    lines = []
+    def _missing(v):
+        if v is None or v == "":
+            return True
+        try:
+            return float(v) <= 0
+        except (TypeError, ValueError):
+            return True
+    a_missing = _missing(arcus_avg)
+    h_missing = _missing(hl_avg)
+    try:
+        planned = float(planned_raw_bps)
+    except (TypeError, ValueError):
+        planned = None
+    if a_missing or h_missing:
+        a_txt = "缺失" if a_missing else fnum(arcus_avg)
+        h_txt = "缺失" if h_missing else fnum(hl_avg)
+        lines.append(
+            f"【告警】成交均价缺失，无法回算实际开仓边。"
+            f"Arcus 均价 {a_txt}，Entropy 均价 {h_txt}。"
+            "不会把保护限价当成均价。"
+        )
+        return lines
+    actual = realized_open_raw_bps(long_venue, arcus_avg, hl_avg)
+    if actual is None:
+        lines.append("【告警】成交均价无效，无法回算实际开仓边。不会把保护限价当成均价。")
+        return lines
+    fee = None
+    try:
+        if fee_open is not None:
+            fee = float(fee_open)
+    except (TypeError, ValueError):
+        fee = None
+    actual_net = actual - fee if fee is not None else None
+    planned_txt = f"{planned:+.2f}bp" if planned is not None else "—"
+    net_txt = f"，实际扣开仓费后 {actual_net:+.2f}bp" if actual_net is not None else ""
+    lines.append(
+        f"实际开仓边（按真实均价）{actual:+.2f}bp，下单前可成交边 {planned_txt}{net_txt}。"
+        f"Arcus 均价 {fnum(arcus_avg)} / Entropy 均价 {fnum(hl_avg)}。"
+    )
+    if planned is not None:
+        slip = planned - actual
+        if slip >= float(warn_bp):
+            net_slip_txt = f"，实际净边比计划差 {slip:.2f}bp" if actual_net is not None else ""
+            lines.append(
+                f"【告警】实际开仓边比下单前报价差 {slip:.2f}bp（≥ {float(warn_bp):.1f}bp）{net_slip_txt}，可能被滑点吃掉。"
+            )
+    return lines
+
+
+def resolve_arcus_avg_px(keys, body, sleep_fn=None, retries: int = 1) -> dict:
+    """从下单回报、订单查询或成交明细取 Arcus 真实均价。查不到则标记缺失，不用保护限价。"""
+    avg, src = extract_arcus_avg_px(body)
+    out = {"avg_px": avg, "avg_px_source": src if avg is not None else "missing", "order_id": order_id_of(body)}
+    if out["avg_px"] is not None:
+        return out
+    oid = out["order_id"]
+    if not oid or keys is None:
+        return out
+    waiter = sleep_fn or time.sleep
+    last_err = None
+    for attempt in range(max(1, int(retries))):
+        if attempt:
+            try:
+                waiter(0.4)
+            except Exception:
+                pass
+        api_key = None
+        try:
+            _priv, api_key = arcus_priv(keys)
+        except Exception:
+            api_key = None
+        try:
+            st, ob = arcus_get(
+                f"/v1/order/{urllib.parse.quote(str(oid), safe='')}",
+                {"address": keys.arcus_wallet_address, "accountIndex": keys.arcus_account_index},
+                api_key,
+            )
+            if st == 200:
+                avg, src = extract_arcus_avg_px(ob if isinstance(ob, dict) else {})
+                if avg is not None:
+                    out["avg_px"] = avg
+                    out["avg_px_source"] = f"order:{src}"
+                    return out
+            elif st == 429:
+                last_err = "order 429"
+                _say(f"查询 Arcus 订单 {oid} 均价触发限速（429），本轮不把保护限价当作均价。")
+                break
+        except Exception as e:
+            last_err = redact(str(e))
+        try:
+            st, fb = arcus_get(
+                "/v1/fills",
+                {
+                    "address": keys.arcus_wallet_address,
+                    "accountIndex": keys.arcus_account_index,
+                    "limit": 100,
+                },
+                api_key,
+            )
+            if st == 200:
+                avg, src = avg_px_from_fills(fb, oid)
+                if avg is not None:
+                    out["avg_px"] = avg
+                    out["avg_px_source"] = src
+                    return out
+            elif st == 429:
+                last_err = "fills 429"
+                _say("查询 Arcus 成交明细触发限速（429），均价标记为缺失。")
+                break
+        except Exception as e:
+            last_err = redact(str(e))
+    if last_err:
+        out["note"] = last_err
+    return out
+
 def open_fill_info(venue: str, body) -> dict:
-    """解析开仓回报。kind: filled / unfilled / rejected / pending / unknown。"""
-    info = {"kind": "unknown", "filled_size": 0.0, "reason": ""}
+    """解析开仓回报。kind: filled / unfilled / rejected / pending / unknown。
+    avg_px 只来自均价字段或成交明细，不会把保护限价/limit price 当成均价。
+    """
+    info = {"kind": "unknown", "filled_size": 0.0, "reason": "", "avg_px": None, "avg_px_source": "missing"}
     if body is None:
         info["reason"] = "empty"
         return info
@@ -352,7 +704,7 @@ def open_fill_info(venue: str, body) -> dict:
             filled = 0.0
         if filled <= 0 and st == "FILLED":
             try:
-                qty = float(body.get("quantity") or 0)
+                qty = float(body.get("quantity") or body.get("originalSize") or 0)
                 rem = float(body.get("remainingSize") or 0)
                 if qty - rem > 0:
                     filled = qty - rem
@@ -362,6 +714,9 @@ def open_fill_info(venue: str, body) -> dict:
         info["reason"] = reason or st
         if filled > 0 or st == "FILLED":
             info["kind"] = "filled"
+            avg, src = extract_arcus_avg_px(body)
+            info["avg_px"] = avg
+            info["avg_px_source"] = src if avg is not None else "missing"
             return info
         if st in {"REJECTED", "FAILED"}:
             info["kind"] = "rejected"
@@ -405,6 +760,9 @@ def open_fill_info(venue: str, body) -> dict:
         info["kind"] = "filled"
         info["filled_size"] = filled_sz
         info["reason"] = "filled"
+        avg, src = extract_hl_avg_px(body)
+        info["avg_px"] = avg
+        info["avg_px_source"] = src if avg is not None else "missing"
         return info
     if errors:
         info["kind"] = "rejected"
@@ -548,7 +906,7 @@ def arcus_build_order(
     size,
     price: Optional[str],
 ) -> dict:
-    tick = market["tickSize"]
+    tick = market_price_tick(market)
     step = market["stepSize"]
     mid = market.get("markPrice") or market.get("oraclePrice") or market.get("lastTradePrice")
     if mid is None:
@@ -559,16 +917,15 @@ def arcus_build_order(
     if price:
         px = snap_decimal(price, tick)
         order_type, tif = "LIMIT", "GTT"
+        px = apply_arcus_offhours_limit(market, is_buy, mid_d, px, tick)
     else:
-        # 保护限价：买入上浮、卖出下调 5%，并保证在官方 10% 滑点带内
+        # 保护限价：买入上浮、卖出下调 5%，按 tick 向更容易成交方向取整，且不越过盘后限幅
         raw = mid_d * (1 + SLIPPAGE) if is_buy else mid_d * (1 - SLIPPAGE)
-        px = snap_decimal(raw, tick, rounding=ROUND_CEILING if is_buy else ROUND_FLOOR)
+        px = snap_close_limit(raw, tick, is_buy, market)
         order_type, tif = "MARKET", "IOC"
         band = mid_d * Decimal("0.10")
-        if abs(px - mid_d) > band + Decimal(str(tick)):
+        if abs(px - mid_d) > band + tick:
             raise TradeError("Arcus 保护限价超出标记价 10% 的允许范围，请改用 --price 指定限价。")
-
-    px = apply_arcus_offhours_limit(market, is_buy, mid_d, px, tick)
 
     ts = time.time_ns()
     good_til = int(time.time() * 1_000_000) + GTT_MONTHS_US
@@ -1172,8 +1529,8 @@ def cmd_plan_or_live(keys: Keys, args) -> int:
 
 def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
     global LAST_OPEN_RESULT
-    # 上面那次「腿 1」可能顺序混乱，这里重新完整打印两腿。
-    _say("—— 将发送的两腿（完整）——")
+    # 盯盘日志必须写下完整两腿意图（此前只 print、没有走 _say，日志里这一段是空的）。
+    _say(format_planned_legs(a_ord, h_ord))
     for label, planned in (("Arcus", a_ord), ("Hyperliquid", h_ord)):
         print(f"\n[{label}]")
         print_planned(planned)
@@ -1202,6 +1559,18 @@ def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
         return 1
 
     a_info = open_fill_info("arcus", results["arcus"])
+    if a_info.get("avg_px") is None and a_info.get("kind") == "filled":
+        resolved = resolve_arcus_avg_px(keys, results["arcus"], retries=1)
+        a_info["avg_px"] = resolved.get("avg_px")
+        a_info["avg_px_source"] = resolved.get("avg_px_source") or "missing"
+    if a_info.get("kind") == "filled":
+        if a_info.get("avg_px") is not None:
+            _say(
+                f"Arcus 成交真实均价 {fnum(a_info['avg_px'])}（来源 {a_info.get('avg_px_source')}），"
+                f"不是保护限价 {a_ord.get('price')}。"
+            )
+        else:
+            _say("Arcus 成交真实均价缺失（已查回报/订单/成交明细），不会把保护限价当作均价。")
     LAST_OPEN_RESULT = {"venue": "arcus", **a_info}
     if a_info["kind"] != "filled" or float(a_info.get("filled_size") or 0) <= 0:
         extra = f"，{a_info['reason']}" if a_info.get("reason") else ""
@@ -1227,10 +1596,25 @@ def _emit_and_maybe_send(keys, args, am, hm, a_ord, h_ord, live, dexs) -> int:
         return 1
 
     h_info = open_fill_info("hl", results["hl"])
+    if h_info.get("avg_px") is not None:
+        _say(f"Entropy 成交真实均价 {fnum(h_info['avg_px'])}（来源 {h_info.get('avg_px_source')}）。")
+    elif h_info.get("kind") == "filled":
+        _say("Entropy 成交真实均价缺失，不会把保护限价当作均价。")
     if h_info["kind"] != "filled" or float(h_info.get("filled_size") or 0) <= 0:
         extra = f"，{h_info['reason']}" if h_info.get("reason") else ""
         _say(f"Hyperliquid / Entropy 未确认成交（{h_info['kind']}{extra}）。Arcus 可能已成交，盯盘将按单腿处理。")
         return 1
+    LAST_OPEN_RESULT = {
+        "venue": "both",
+        "kind": "filled",
+        "reason": "filled",
+        "filled_size": h_info.get("filled_size") or a_info.get("filled_size"),
+        "arcus": a_info,
+        "hl": h_info,
+        "arcus_avg_px": a_info.get("avg_px"),
+        "hl_avg_px": h_info.get("avg_px"),
+        "avg_px": a_info.get("avg_px"),
+    }
     _say("两腿均已确认成交。")
     return 0
 
